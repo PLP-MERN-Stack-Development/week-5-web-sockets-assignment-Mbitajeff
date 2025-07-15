@@ -26,55 +26,100 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Store connected users and messages
+// Store connected users, messages, and rooms
 const users = {};
 const messages = [];
 const typingUsers = {};
+const rooms = { 'General': { name: 'General', users: [] } }; // Default room
 
 // Socket.io connection handler
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
-  // Handle user joining
+  // Handle user joining (default to General room)
   socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
+    users[socket.id] = { username, id: socket.id, room: 'General' };
+    socket.join('General');
+    rooms['General'].users.push(socket.id);
     io.emit('user_list', Object.values(users));
     io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
+    io.emit('room_list', Object.keys(rooms));
+    console.log(`${username} joined the chat (General)`);
   });
 
-  // Handle chat messages
+  // Handle room creation
+  socket.on('create_room', (roomName) => {
+    if (!rooms[roomName]) {
+      rooms[roomName] = { name: roomName, users: [] };
+      io.emit('room_list', Object.keys(rooms));
+    }
+  });
+
+  // Handle joining a room
+  socket.on('join_room', (roomName) => {
+    const user = users[socket.id];
+    if (user && rooms[roomName]) {
+      // Leave previous room
+      socket.leave(user.room);
+      if (rooms[user.room]) {
+        rooms[user.room].users = rooms[user.room].users.filter(id => id !== socket.id);
+      }
+      // Join new room
+      socket.join(roomName);
+      user.room = roomName;
+      rooms[roomName].users.push(socket.id);
+      io.emit('user_list', Object.values(users));
+      io.emit('room_list', Object.keys(rooms));
+      io.to(roomName).emit('system_message', `${user.username} joined ${roomName}`);
+    }
+  });
+
+  // Handle leaving a room
+  socket.on('leave_room', (roomName) => {
+    const user = users[socket.id];
+    if (user && rooms[roomName]) {
+      socket.leave(roomName);
+      rooms[roomName].users = rooms[roomName].users.filter(id => id !== socket.id);
+      io.to(roomName).emit('system_message', `${user.username} left ${roomName}`);
+      // Optionally, join General room
+      socket.join('General');
+      user.room = 'General';
+      rooms['General'].users.push(socket.id);
+      io.emit('user_list', Object.values(users));
+      io.emit('room_list', Object.keys(rooms));
+    }
+  });
+
+  // Handle chat messages (room-based)
   socket.on('send_message', (messageData) => {
+    const user = users[socket.id];
+    const room = user?.room || 'General';
     const message = {
       ...messageData,
       id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
+      sender: user?.username || 'Anonymous',
       senderId: socket.id,
+      room,
       timestamp: new Date().toISOString(),
     };
-    
     messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
-    }
-    
-    io.emit('receive_message', message);
+    if (messages.length > 100) messages.shift();
+    io.to(room).emit('receive_message', message);
+    // Notification event for new message
+    io.to(room).emit('notify_message', message);
   });
 
-  // Handle typing indicator
+  // Handle typing indicator (room-based)
   socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
+    const user = users[socket.id];
+    if (user) {
+      const username = user.username;
       if (isTyping) {
         typingUsers[socket.id] = username;
       } else {
         delete typingUsers[socket.id];
       }
-      
-      io.emit('typing_users', Object.values(typingUsers));
+      io.to(user.room).emit('typing_users', Object.values(typingUsers));
     }
   });
 
@@ -88,24 +133,28 @@ io.on('connection', (socket) => {
       timestamp: new Date().toISOString(),
       isPrivate: true,
     };
-    
     socket.to(to).emit('private_message', messageData);
     socket.emit('private_message', messageData);
+    // Notification event for private message
+    socket.to(to).emit('notify_private', messageData);
   });
 
   // Handle disconnection
   socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const { username } = users[socket.id];
+    const user = users[socket.id];
+    if (user) {
+      const { username, room } = user;
       io.emit('user_left', { username, id: socket.id });
+      if (rooms[room]) {
+        rooms[room].users = rooms[room].users.filter(id => id !== socket.id);
+      }
       console.log(`${username} left the chat`);
     }
-    
     delete users[socket.id];
     delete typingUsers[socket.id];
-    
     io.emit('user_list', Object.values(users));
     io.emit('typing_users', Object.values(typingUsers));
+    io.emit('room_list', Object.keys(rooms));
   });
 });
 
@@ -116,6 +165,10 @@ app.get('/api/messages', (req, res) => {
 
 app.get('/api/users', (req, res) => {
   res.json(Object.values(users));
+});
+
+app.get('/api/rooms', (req, res) => {
+  res.json(Object.keys(rooms));
 });
 
 // Root route
